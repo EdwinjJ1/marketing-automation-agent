@@ -63,7 +63,7 @@ class MarketingAgent:
         document: str,
         images: Optional[List[str]] = None,
         platforms: Optional[List[str]] = None,
-        schedule: Optional[str] = None
+        schedule: Optional[datetime] = None
     ) -> Dict[str, Any]:
         """
         处理文档并发布到各平台
@@ -183,11 +183,11 @@ class MarketingAgent:
 
         spec = platform_specs.get(platform, platform_specs["x"])
 
-        # 使用LLM生成内容（简化版）
-        if self.llm and CREWAI_AVAILABLE:
+        # 使用LLM生成内容（直连模式，不依赖CrewAI）
+        if self.llm:
             content = self._generate_with_llm(platform, key_info, spec)
         else:
-            # 降级到模板生成
+            # LLM不可用时降级到模板生成
             content = self._generate_with_template(platform, key_info, spec)
 
         return {

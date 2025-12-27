@@ -32,9 +32,10 @@ def init_db() -> None:
                 content_id TEXT NOT NULL,
                 platforms TEXT NOT NULL,
                 scheduled_time TEXT NOT NULL,
-                status TEXT DEFAULT 'pending',
+                status TEXT DEFAULT 'scheduled',
                 created_at TEXT NOT NULL,
-                executed_at TEXT,
+                started_at TEXT,
+                finished_at TEXT,
                 error TEXT,
                 result TEXT
             )
@@ -46,6 +47,18 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             )
         """)
+        # 幂等表：防止重复发布
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS published_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                post_id TEXT,
+                post_url TEXT,
+                published_at TEXT NOT NULL,
+                UNIQUE(task_id, platform)
+            )
+        """)
         # 创建索引
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_tasks_status
@@ -54,6 +67,10 @@ def init_db() -> None:
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_tasks_scheduled_time
             ON scheduled_tasks(scheduled_time)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_published_task_platform
+            ON published_posts(task_id, platform)
         """)
         conn.commit()
     finally:
@@ -139,14 +156,78 @@ def update_task_status(
     error: str = None,
     result: str = None
 ) -> None:
-    """更新任务状态"""
+    """
+    更新任务状态
+
+    状态流转: scheduled -> running -> completed/failed/partial_failure
+    """
+    conn = get_connection()
+    try:
+        now = datetime.now().isoformat()
+
+        if status == "running":
+            # 任务开始执行
+            conn.execute("""
+                UPDATE scheduled_tasks
+                SET status = ?, started_at = ?
+                WHERE task_id = ?
+            """, (status, now, task_id))
+        elif status in ("completed", "failed", "partial_failure"):
+            # 任务完成
+            conn.execute("""
+                UPDATE scheduled_tasks
+                SET status = ?, error = ?, result = ?, finished_at = ?
+                WHERE task_id = ?
+            """, (status, error, result, now, task_id))
+        else:
+            # 其他状态 (cancelled 等)
+            conn.execute("""
+                UPDATE scheduled_tasks
+                SET status = ?, error = ?
+                WHERE task_id = ?
+            """, (status, error, task_id))
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def check_published(task_id: str, platform: str) -> Optional[Dict[str, Any]]:
+    """
+    检查是否已发布（幂等检查）
+
+    Returns:
+        已发布记录 或 None
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM published_posts WHERE task_id = ? AND platform = ?",
+            (task_id, platform)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def mark_published(
+    task_id: str,
+    platform: str,
+    post_id: str = None,
+    post_url: str = None
+) -> None:
+    """
+    标记为已发布（幂等写入）
+
+    如果已存在则忽略（不抛异常）
+    """
     conn = get_connection()
     try:
         conn.execute("""
-            UPDATE scheduled_tasks
-            SET status = ?, error = ?, result = ?, executed_at = ?
-            WHERE task_id = ?
-        """, (status, error, result, datetime.now().isoformat(), task_id))
+            INSERT OR IGNORE INTO published_posts
+            (task_id, platform, post_id, post_url, published_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (task_id, platform, post_id, post_url, datetime.now().isoformat()))
         conn.commit()
     finally:
         conn.close()
@@ -209,26 +290,75 @@ def list_tasks(
         conn.close()
 
 
-def cleanup_old_content(days: int = 7) -> int:
+def cleanup_old_content(days: int = 7) -> Dict[str, int]:
     """
-    清理旧的内容记录
+    安全清理旧的内容记录
+
+    只删除已完成/失败/取消的任务内容，保留未来计划任务的内容
 
     Args:
-        days: 保留最近N天的内容
+        days: 保留最近N天的已完成任务内容
 
     Returns:
-        删除的记录数
+        删除统计 {"contents": n, "tasks": m, "published": p}
     """
     from datetime import timedelta
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
 
     conn = get_connection()
     try:
-        cursor = conn.execute(
-            "DELETE FROM task_contents WHERE created_at < ?",
-            (cutoff,)
+        # 找出可以安全删除的 content_id
+        # 条件：关联任务状态为 completed/failed/cancelled/partial_failure
+        # 且任务创建时间早于阈值
+        safe_content_ids = conn.execute("""
+            SELECT DISTINCT tc.content_id
+            FROM task_contents tc
+            JOIN scheduled_tasks st ON tc.content_id = st.content_id
+            WHERE st.status IN ('completed', 'failed', 'cancelled', 'partial_failure')
+            AND st.created_at < ?
+        """, (cutoff,)).fetchall()
+
+        content_ids = [row[0] for row in safe_content_ids]
+
+        if not content_ids:
+            return {"contents": 0, "tasks": 0, "published": 0}
+
+        # 删除内容
+        placeholders = ','.join('?' * len(content_ids))
+        cursor1 = conn.execute(
+            f"DELETE FROM task_contents WHERE content_id IN ({placeholders})",
+            content_ids
         )
+        deleted_contents = cursor1.rowcount
+
+        # 删除关联的任务记录
+        cursor2 = conn.execute(
+            f"DELETE FROM scheduled_tasks WHERE content_id IN ({placeholders})",
+            content_ids
+        )
+        deleted_tasks = cursor2.rowcount
+
+        # 删除关联的发布记录
+        task_ids = conn.execute(
+            f"SELECT task_id FROM scheduled_tasks WHERE content_id IN ({placeholders})",
+            content_ids
+        ).fetchall()
+        task_id_list = [row[0] for row in task_ids]
+
+        deleted_published = 0
+        if task_id_list:
+            task_placeholders = ','.join('?' * len(task_id_list))
+            cursor3 = conn.execute(
+                f"DELETE FROM published_posts WHERE task_id IN ({task_placeholders})",
+                task_id_list
+            )
+            deleted_published = cursor3.rowcount
+
         conn.commit()
-        return cursor.rowcount
+        return {
+            "contents": deleted_contents,
+            "tasks": deleted_tasks,
+            "published": deleted_published
+        }
     finally:
         conn.close()

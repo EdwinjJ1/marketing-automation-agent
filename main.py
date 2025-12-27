@@ -110,35 +110,44 @@ def main():
     schedule = None
     if args.schedule:
         import pytz
-        try:
-            from tzlocal import get_localzone
-        except ImportError:
-            get_localzone = None
+
+        # 辅助函数：将naive datetime转为timezone-aware
+        def make_aware(dt, tz):
+            """兼容 pytz 和 zoneinfo 的时区转换"""
+            if hasattr(tz, 'localize'):
+                # pytz 时区
+                return tz.localize(dt)
+            else:
+                # zoneinfo 时区 (Python 3.9+ / tzlocal)
+                return dt.replace(tzinfo=tz)
 
         # 确定时区
+        tz = None
         if args.timezone:
             try:
                 tz = pytz.timezone(args.timezone)
             except pytz.UnknownTimeZoneError:
                 print(f"错误: 未知时区: {args.timezone}")
                 sys.exit(1)
-        elif get_localzone:
-            tz = get_localzone()
         else:
-            tz = pytz.UTC
-            print("警告: 未安装tzlocal，使用UTC时区")
+            try:
+                from tzlocal import get_localzone
+                tz = get_localzone()
+            except ImportError:
+                tz = pytz.UTC
+                print("警告: 未安装tzlocal，使用UTC时区")
 
         # 尝试解析时间
         try:
             # 先尝试ISO格式 (可能包含时区)
             schedule = datetime.fromisoformat(args.schedule)
             if schedule.tzinfo is None:
-                schedule = tz.localize(schedule)
+                schedule = make_aware(schedule, tz)
         except ValueError:
             try:
                 # 回退到简单格式
                 schedule = datetime.strptime(args.schedule, "%Y-%m-%d %H:%M")
-                schedule = tz.localize(schedule)
+                schedule = make_aware(schedule, tz)
             except ValueError:
                 print(f"错误: 时间格式不正确，应为 'YYYY-MM-DD HH:MM' 或 ISO格式")
                 sys.exit(1)
